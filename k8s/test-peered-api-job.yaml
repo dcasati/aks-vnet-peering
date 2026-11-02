@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-peered-api-connectivity
+  namespace: default
+  labels:
+    app: test-peered-api
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: test-peered-api
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: curl-test
+          image: curlimages/curl:8.10.1
+          env:
+            - name: TARGET_API_URL
+              value: "http://10.200.1.10:8080/health"
+            - name: EXPECTED_NAT_PREFIX
+              value: "10.100.0."
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "=========================================================="
+              echo "AKS Automatic -> VMSS IP Masquerade -> Peered VNet Test"
+              echo "=========================================================="
+              echo "Pod IP (Overlay):        ${POD_IP}"
+              echo "AKS Node IP (Non-peered): ${NODE_IP}"
+              echo "Target Peered API URL:   ${TARGET_API_URL}"
+              echo "----------------------------------------------------------"
+
+              echo "Sending HTTP GET request to peered VNet API..."
+              RESPONSE=$(curl -sS --fail --connect-timeout 10 --max-time 15 "${TARGET_API_URL}")
+
+              echo "Response received from Peered VNet API:"
+              echo "${RESPONSE}"
+              echo "----------------------------------------------------------"
+
+              # Verify the API saw a source IP from the NAT Masquerade subnet (e.g., 10.100.0.x)
+              if echo "${RESPONSE}" | grep -q "\"client_ip_seen_by_api\": \"${EXPECTED_NAT_PREFIX}"; then
+                echo "SUCCESS: Traffic was masqueraded by the NAT VMSS (${EXPECTED_NAT_PREFIX}x)!"
+                exit 0
+              else
+                echo "ERROR: Expected source IP to match prefix ${EXPECTED_NAT_PREFIX}, but got:"
+                echo "${RESPONSE}"
+                exit 1
+              fi
+
