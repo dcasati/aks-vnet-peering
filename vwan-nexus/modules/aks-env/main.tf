@@ -129,18 +129,21 @@ resource "azurerm_subnet_nat_gateway_association" "aks_user" {
 }
 
 # =============================================================================
-# 4. UDR: Nexus prefix -> NVA internal LB in the peered transit VNet
+# 4. UDR: private destinations (Nexus, on-prem) -> NVA internal LB in the peered transit VNet
 # =============================================================================
 resource "azurerm_route_table" "aks" {
   name                = "rt-${var.name}-aks-to-nexus"
   location            = var.location
   resource_group_name = var.resource_group_name
 
-  route {
-    name                   = "nexus-via-transit-nva"
-    address_prefix         = var.nexus_cidr
-    next_hop_type          = "VirtualAppliance"
-    next_hop_in_ip_address = local.nva_ilb_ip
+  dynamic "route" {
+    for_each = var.destination_cidrs
+    content {
+      name                   = "via-transit-nva-${replace(route.value, "/[./]/", "-")}"
+      address_prefix         = route.value
+      next_hop_type          = "VirtualAppliance"
+      next_hop_in_ip_address = local.nva_ilb_ip
+    }
   }
 }
 
@@ -279,8 +282,8 @@ resource "azurerm_linux_virtual_machine_scale_set" "nva" {
   }
 
   custom_data = base64encode(templatefile("${path.module}/nva-cloud-init.yaml.tftpl", {
-    internal_cidr = var.internal_cidr
-    nexus_cidr    = var.nexus_cidr
+    internal_cidr     = var.internal_cidr
+    destination_cidrs = var.destination_cidrs
   }))
 
   network_interface {

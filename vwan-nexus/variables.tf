@@ -131,3 +131,27 @@ variable "enable_custom_ca_trust" {
   type        = bool
   default     = true
 }
+
+variable "onprem_cidrs" {
+  description = "On-prem prefixes (learned by the hub over ExpressRoute/VPN) that AKS reaches through the transit NVA. Prefer a few summaries."
+  type        = list(string)
+  default     = []
+}
+
+variable "create_onprem_sim" {
+  description = "PoC only: simulate on-prem with a VNet + VPN gateway connected to the hub by site-to-site VPN with BGP (propagates like ExpressRoute). Adds ~45 min and gateway costs."
+  type        = bool
+  default     = false
+}
+
+variable "onprem_sim_cidr" {
+  description = "Address space of the simulated on-prem network (must not overlap the hub, Nexus, transit or AKS ranges)"
+  type        = string
+  default     = "10.40.0.0/24"
+}
+
+variable "onprem_sim_asn" {
+  description = "BGP ASN of the simulated on-prem VPN device"
+  type        = number
+  default     = 65010
+}

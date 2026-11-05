@@ -10,6 +10,13 @@ resource "tls_private_key" "ssh" {
 
 locals {
   nexus_fqdn = "${var.nexus_hostname}.${var.private_dns_zone_name}"
+
+  # Everything AKS reaches through its transit NVA -> vWAN hub. Internet/MCR stays on the AKS NAT gateway.
+  private_destinations = distinct(concat(
+    [var.nexus_cidr],
+    var.onprem_cidrs,
+    var.create_onprem_sim ? [var.onprem_sim_cidr] : [],
+  ))
 }
 
 # =============================================================================
@@ -258,7 +265,7 @@ module "env" {
   virtual_hub_id      = local.virtual_hub_id
   transit_cidr        = each.value.transit_cidr
   internal_cidr       = each.value.internal_cidr
-  nexus_cidr          = var.nexus_cidr
+  destination_cidrs   = local.private_destinations
   ssh_public_key      = tls_private_key.ssh.public_key_openssh
   nva_vmss_sku        = var.nva_vmss_sku
   nva_vmss_instances  = var.nva_vmss_instances

@@ -35,3 +35,17 @@ output "nexus_cidr" {
   description = "Nexus spoke prefix that each environment routes to its transit NVA"
   value       = var.nexus_cidr
 }
+
+output "private_destinations" {
+  description = "Prefixes each environment routes through its transit NVA (Nexus + on-prem)"
+  value       = local.private_destinations
+}
+
+output "onprem_sim" {
+  description = "Simulated on-prem (create_onprem_sim): echo endpoint, gateway name, prefix"
+  value = var.create_onprem_sim ? {
+    cidr         = var.onprem_sim_cidr
+    echo_url     = "http://${local.onprem_echo_ip}/"
+    gateway_name = azurerm_virtual_network_gateway.onprem[0].name
+  } : null
+}

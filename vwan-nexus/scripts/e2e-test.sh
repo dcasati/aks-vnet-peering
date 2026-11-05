@@ -5,7 +5,7 @@ set -Eeuo pipefail
 trap exit SIGINT SIGTERM
 
 ################################################################################
-# AKS Automatic -> transit NVA -> vWAN hub -> Nexus: end-to-end test
+# AKS Automatic -> transit NVA -> vWAN hub -> Nexus (and on-prem): end-to-end test
 #
 # Proves, for one environment:
 #   1. routing      the hub gives the transit VNet a route to Nexus, gives the
@@ -18,6 +18,10 @@ trap exit SIGINT SIGTERM
 #                   NAP nodes created before CA trust was set are not reimaged;
 #                   with RECYCLE_NODES=true their NodeClaims are deleted and the
 #                   pull is retried on fresh nodes.
+#   6. onprem       (only with create_onprem_sim) the hub gives the transit VNet
+#                   the on-prem prefix, on-prem learns the transit /28 but never
+#                   the AKS range, and a pod reaches an on-prem server that sees
+#                   an NVA transit IP as the client.
 #
 # Everything else is read from `terraform output` in TF_DIR.
 
@@ -45,7 +49,10 @@ Possible verbs are:
     ca-trust       Assert the private CA is set in securityProfile.
     pod-pull       Run the crane Job (TLS with private CA, push + pull, MB/s).
     kubelet-pull   Pull from Nexus via kubelet/containerd (node CA trust).
+    onprem         Assert routes to/from simulated on-prem and SNAT'd reachability.
     recycle-nodes  Delete all NAP NodeClaims so NAP provisions fresh nodes.
+    nva-reimage    Reimage NVA instances one at a time (applies new custom_data,
+                   e.g. after changing private destinations) and verify SNAT rules.
     cleanup        Delete the test Job/Pod (secrets and configmap are kept).
 
 Environment variables (with defaults):
@@ -117,12 +124,15 @@ load_outputs() {
   RESOURCE_GROUP=$(tf_out resource_group_name)
   HUB_ID=$(tf_out virtual_hub_id)
   NEXUS_CIDR=$(tf_out nexus_cidr)
+  PRIVATE_DESTINATIONS=$(terraform -chdir="$TF_DIR" output -json private_destinations | jq -r '.[]')
+  ONPREM_JSON=$(terraform -chdir="$TF_DIR" output -json onprem_sim)
   NEXUS_REGISTRY=$(tf_out nexus_registry)
   CA_FILE=$(tf_out ca_cert_file)
   _env_json=$(terraform -chdir="$TF_DIR" output -json environments | jq -e --arg e "$ENV_NAME" '.[$e]') ||
     fail "environment '$ENV_NAME' not found in terraform output"
   CLUSTER_NAME=$(jq -r .cluster_name <<<"$_env_json")
   TRANSIT_CIDR=$(jq -r .transit_cidr <<<"$_env_json")
+  NVA_VMSS="vmss-${ENV_NAME}-nva"
   AKS_CIDR=$(jq -r .aks_internal_cidr <<<"$_env_json")
   # Relative paths in outputs are relative to TF_DIR.
   case "$CA_FILE" in
@@ -195,6 +205,92 @@ do_nva() {
   log "ILB backend health (DipAvailability, last full minute): ${_avail:-n/a}%"
   [[ "${_avail%.*}" == "100" ]] || fail "not all NVA instances are healthy"
   log "PASS nva: all NVA backends healthy"
+}
+
+# Prints the MASQUERADE destinations configured on one NVA instance.
+nva_snat_destinations() {
+  az vmss run-command invoke -g "$RESOURCE_GROUP" -n "$NVA_VMSS" --instance-id "$1" \
+    --command-id RunShellScript --scripts "iptables -t nat -S POSTROUTING | grep MASQUERADE" \
+    --query 'value[0].message' -o tsv |
+    grep -oE -- '-d [0-9./]+' | awk '{print $2}'
+}
+
+do_nva_reimage() {
+  load_outputs
+  local _id _dst _have
+
+  for _id in $(az vmss list-instances -g "$RESOURCE_GROUP" -n "$NVA_VMSS" --query '[].instanceId' -o tsv); do
+    log "Reimaging $NVA_VMSS instance $_id (the other instances keep serving behind the ILB)"
+    az vmss reimage -g "$RESOURCE_GROUP" -n "$NVA_VMSS" --instance-ids "$_id" -o none
+    _have=""
+    for _ in $(seq 1 30); do
+      _have=$(nva_snat_destinations "$_id" 2>/dev/null || true)
+      [[ -n "$_have" ]] && break
+      sleep 10
+    done
+    for _dst in $PRIVATE_DESTINATIONS; do
+      grep -qxF "$_dst" <<<"$_have" || fail "instance $_id has no SNAT rule for $_dst"
+    done
+    log "  instance $_id SNATs: $(tr '\n' ' ' <<<"$_have")"
+  done
+  log "PASS nva-reimage: every instance SNATs all private destinations"
+}
+
+do_onprem() {
+  load_outputs
+  local _cidr _url _gw _transit_routes _learned _nva_ips _out _client _phase
+
+  [[ "$ONPREM_JSON" != "null" ]] || fail "no simulated on-prem; apply with -var create_onprem_sim=true"
+  _cidr=$(jq -r .cidr <<<"$ONPREM_JSON")
+  _url=$(jq -r .echo_url <<<"$ONPREM_JSON")
+  _gw=$(jq -r .gateway_name <<<"$ONPREM_JSON")
+
+  _transit_routes=$(hub_routes "conn-${ENV_NAME}-transit")
+  log "Hub routes on conn-${ENV_NAME}-transit: $(tr '\n' ' ' <<<"$_transit_routes")"
+  grep -qxF "$_cidr" <<<"$_transit_routes" || fail "transit VNet has no hub route to on-prem $_cidr"
+
+  _learned=$(az network vnet-gateway list-learned-routes -g "$RESOURCE_GROUP" -n "$_gw" \
+    --query "value[?origin=='EBgp'].network" -o tsv | sort -u)
+  log "On-prem gateway learned over BGP: $(tr '\n' ' ' <<<"$_learned")"
+  grep -qxF "$TRANSIT_CIDR" <<<"$_learned" || fail "on-prem did not learn transit $TRANSIT_CIDR"
+  if grep -qxF "$AKS_CIDR" <<<"$_learned"; then
+    fail "AKS range $AKS_CIDR leaked to on-prem"
+  fi
+
+  log "Pod -> $_url (simulated on-prem server; NSG admits only the transit /28s)"
+  kubectl -n "$NAMESPACE" delete pod onprem-test --ignore-not-found --wait=true >/dev/null
+  # Deployment safeguards on AKS Automatic reject pods without resource requests.
+  kubectl -n "$NAMESPACE" apply -f - <<EOF 2>&1 | grep -v '^Warning:' || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: onprem-test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: onprem-test
+      image: gcr.io/go-containerregistry/crane:debug
+      command: ["/busybox/wget", "-q", "-T", "10", "-O-", "$_url"]
+      resources:
+        requests: {cpu: 50m, memory: 32Mi}
+        limits: {cpu: 200m, memory: 64Mi}
+EOF
+  kubectl -n "$NAMESPACE" get pod onprem-test >/dev/null 2>&1 || fail "onprem-test pod was not created"
+  _phase=Pending
+  for _ in $(seq 1 60); do
+    _phase=$(kubectl -n "$NAMESPACE" get pod onprem-test -o jsonpath='{.status.phase}' 2>/dev/null || echo Unknown)
+    [[ "$_phase" == "Succeeded" || "$_phase" == "Failed" ]] && break
+    sleep 5
+  done
+  _out=$(kubectl -n "$NAMESPACE" logs onprem-test 2>&1 || true)
+  log "  on-prem server replied: ${_out}"
+  [[ "$_phase" == "Succeeded" ]] || fail "pod could not reach on-prem (phase $_phase)"
+
+  _client=$(sed -n 's/^client=\([0-9.]*\).*/\1/p' <<<"$_out")
+  _nva_ips=$(az vmss nic list -g "$RESOURCE_GROUP" --vmss-name "$NVA_VMSS" \
+    --query '[].ipConfigurations[0].privateIPAddress' -o tsv)
+  grep -qxF "$_client" <<<"$_nva_ips" || fail "on-prem saw $_client, not an NVA transit IP ($(tr '\n' ' ' <<<"$_nva_ips"))"
+  log "PASS onprem: on-prem sees NVA transit IP $_client; $AKS_CIDR never advertised to on-prem"
 }
 
 do_ca_trust() {
@@ -290,6 +386,7 @@ do_kubelet_pull() {
 do_cleanup() {
   kubectl -n "$NAMESPACE" delete job nexus-pull-test --ignore-not-found >/dev/null
   kubectl -n "$NAMESPACE" delete pod kubelet-pull-test --ignore-not-found >/dev/null
+  kubectl -n "$NAMESPACE" delete pod onprem-test --ignore-not-found >/dev/null
   log "Test workloads deleted"
 }
 
@@ -301,6 +398,11 @@ do_all() {
   do_ca_trust
   do_pod_pull
   do_kubelet_pull
+  if [[ "$ONPREM_JSON" != "null" ]]; then
+    do_onprem
+  else
+    log "SKIP onprem: no simulated on-prem (create_onprem_sim=false)"
+  fi
   log ""
   log "ALL TESTS PASSED for $ENV_NAME"
 }
@@ -317,7 +419,9 @@ exec_case() {
     ca-trust) do_ca_trust ;;
     pod-pull) do_pod_pull ;;
     kubelet-pull) do_kubelet_pull ;;
+    onprem) do_onprem ;;
     recycle-nodes) do_recycle_nodes ;;
+    nva-reimage) do_nva_reimage ;;
     cleanup) do_cleanup ;;
     *) usage ;;
   esac

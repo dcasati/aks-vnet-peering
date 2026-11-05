@@ -5,8 +5,7 @@ Constraints this design solves for:
 - AKS Automatic clusters (DEV / QA / PROD, CNI Overlay, BYO VNet with API `/28`, system `/26`, user `/24`) must pull images from **Nexus**. ACR isn't allowed.
 - Nexus lives in a shared spoke that is connected to the **vWAN hub**. AKS → Nexus traffic **must transit the hub**.
 - Consume as little routable IP space as possible.
-
-On-premises access is out of scope for now.
+- Then extend the same path to **on-premises** (ExpressRoute behind the hub). See [Extending to on-premises](#extending-to-on-premises).
 
 ## Why the original subnet-peering PoC can't be used as-is with vWAN
 
@@ -64,6 +63,7 @@ Editable source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw) 
 | `k8s/kubelet-pull-test.yaml.tftpl` | Pod that the **kubelet/containerd** pulls from Nexus using `imagePullSecrets`. This is the custom CA trust test |
 | `scripts/e2e-test.sh` | End-to-end test: hub routes, NVA health, CA trust, pod pull, kubelet pull (recycles NAP nodes on x509) |
 | `docs/architecture.{svg,excalidraw}` | Architecture diagram |
+| `onprem-sim.tf`, `onprem-echo-cloud-init.yaml` | Optional simulated on-prem: VNet + VPN gateway + BGP to the hub, and an HTTP echo server |
 | `terraform.tfvars.example` | All three environments on an existing hub, all reusing `100.64.0.0/16` |
 
 By default only `dev` is deployed in `westus3`, along with a new PoC hub and a Nexus stand-in VM. The NVA uses `Standard_D2s_v4` and Nexus uses `Standard_D4s_v4`, because DSv5 isn't offered to every subscription in West US 2/3.
@@ -94,6 +94,8 @@ terraform apply                      # optionally: -var-file=terraform.tfvars
 | `ca-trust` | The private CA is present in `securityProfile.customCATrustCertificates` |
 | `pod-pull` | crane Job over TLS (`SSL_CERT_FILE` = private CA): pushes a seed image through the path, pulls it back, prints throughput |
 | `kubelet-pull` | containerd pulls `nexus.poc.internal/poc/seed:1` with `imagePullSecrets`. On `x509` (a NAP node that predates CA trust) it recycles NAP NodeClaims and retries; `RECYCLE_NODES=false` disables that |
+| `onprem` | With `create_onprem_sim`: the transit connection learns the on-prem prefix, on-prem learns the transit `/28` but never the AKS range, and a pod reaches the on-prem server, which sees an NVA transit IP. Runs in `all` when the simulator exists |
+| `nva-reimage` | Reimages NVA instances one at a time and checks each one SNATs every private destination |
 | `recycle-nodes` | Deletes all NAP NodeClaims (graceful drain). NAP provisions replacements with the current node config |
 
 The Nexus VM's NSG admits only 443 from the transit `/28`s. A successful pull therefore proves that traffic was SNAT'd by the transit NVA and crossed the vWAN hub.
@@ -112,6 +114,58 @@ The Nexus VM's NSG admits only 443 from the transit `/28`s. A successful pull th
 | Full `e2e-test.sh -x all` | ALL TESTS PASSED |
 
 **Takeaway:** a private CA works for Nexus pulls on AKS Automatic. Set custom CA trust **before** workloads land: this Terraform applies it right after cluster creation. If it is added or rotated later, recycle the NAP NodeClaims (`scripts/e2e-test.sh -x recycle-nodes`). Pods that call Nexus themselves still need the CA mounted, because node trust isn't injected into containers.
+
+## Extending to on-premises
+
+On-prem traffic uses **the same transit `/28` and NVA**. No new routable space is needed, and the AKS VNets still never connect to the hub.
+
+```
+AKS node 100.64.x ──UDR(on-prem summaries)──▶ ILB ─▶ NVA (SNAT → 172.19.0.x)
+   ─▶ hub connection ─▶ vWAN hub ─▶ ExpressRoute gateway ─▶ ER Direct ─▶ data centres
+on-prem learns over ER: the three transit /28s (+ Nexus, hub)   never 100.64.0.0/16
+transit VNet learns from the hub: on-prem prefixes (default route table)
+```
+
+What changes:
+
+| Where | Change |
+|---|---|
+| Terraform | Add the on-prem summaries to `onprem_cidrs`. They join Nexus in `private_destinations`, which drives **both** the AKS UDR and the NVA SNAT/FORWARD rules. Internet/MCR stays on the AKS NAT gateway |
+| NVA | `upgrade_mode = "Manual"` and cloud-init only runs at provisioning, so roll the new rules out with `scripts/e2e-test.sh -x nva-reimage` (one instance at a time, verifies the rules) |
+| Hub / ExpressRoute | Nothing new. The hub's ER gateway already advertises connected VNets (the transit `/28`s) to on-prem and propagates on-prem routes to them |
+| On-prem firewalls | Allow the transit `/28`s. Each environment has a stable, distinct source: DEV `172.19.0.0/28`, QA `172.20.0.0/28`, PROD `172.21.0.0/28` |
+| Check Point (routing intent) | With *private* routing intent, VNet ↔ branch traffic is inspected by the hub firewall. Allow the same `/28`s there |
+
+**Only some workloads need on-prem.** Routing is per subnet, not per pod, so restrict it in the cluster: AKS Automatic runs Cilium, so a default-deny egress `NetworkPolicy` with an `ipBlock` for the on-prem summaries in namespaces that don't need it (or an allow-list in those that do) keeps on-prem reachable only where intended. Image pulls are made by the kubelet on the node and aren't affected by pod network policy.
+
+**DNS.** AKS Automatic uses Azure DNS. Resolve on-prem names with an **Azure DNS Private Resolver**: put the outbound endpoint in the shared (hub-connected) spoke so its queries to on-prem DNS servers are routable, and link a **forwarding ruleset** for the on-prem domains to each AKS VNet. The linked VNets don't need to be peered with the resolver's VNet.
+
+**Gotchas:**
+- **On-prem must not advertise the reused AKS range** (`100.64.0.0/16`, or anything more specific inside it). In the transit VNet a BGP route with the same or a longer prefix beats the peering route, breaking return traffic to the nodes. Filter it on the ER edge or with a hub route map on the transit connections. Conversely, on-prem hosts inside `100.64.0.0/16` can't be reached.
+- **Keep summaries short.** A route table holds 400 routes and the module allows 50 destinations. Don't let an on-prem summary (for example `10.0.0.0/8`) cover the cluster's pod/service CIDRs (`10.244.0.0/16`, `10.0.0.0/16` by default) or the AKS VNet; set non-overlapping CIDRs at cluster creation.
+- **Outbound only.** SNAT supports AKS-initiated flows. On-prem-initiated connections to AKS services need a separate design (for example an internal LB or Private Link service published in the transit VNet).
+- **Capacity.** The NVA and the hub now carry image pulls and on-prem traffic. Size NVA instances, hub routing units and ER gateway scale units for both.
+
+### Testing it without ExpressRoute
+
+`-var create_onprem_sim=true` builds a stand-in for the data centres: a VNet (`10.40.0.0/24`) with a VPN gateway that connects to the hub by **site-to-site VPN with BGP**. A branch connection propagates routes the same way ExpressRoute does. An "on-prem server" replies with the client IP it sees, and its NSG admits only the transit `/28`s. Gateways take about 30–45 minutes and cost money while they run.
+
+```bash
+terraform apply -var create_onprem_sim=true
+./scripts/e2e-test.sh -x nva-reimage   # once, to load the new SNAT rules
+./scripts/e2e-test.sh -x onprem        # also part of -x all when the simulator exists
+```
+
+Results (westus3, DEV, `onprem_cidrs` simulated by `10.40.0.0/24`):
+
+| Test | Result |
+|---|---|
+| Hub routes on `conn-dev-transit` | `10.30.0.0/24` (Nexus) + `10.40.0.0/24` (on-prem, via the branch) |
+| Routes on-prem learned over BGP | `172.19.0.0/28` (DEV transit), `10.30.0.0/24`, `10.250.0.0/23` (hub). **`100.64.0.0/16` never advertised** |
+| NVA rollout (`nva-reimage`) | Both instances reimaged one at a time (~2 min each); each SNATs `10.30.0.0/24` and `10.40.0.0/24` |
+| Pod → on-prem server (NSG: transit `/28`s only) | OK. Server saw `client=172.19.0.6`, an NVA transit IP |
+| Nexus pulls with on-prem enabled | Unchanged: crane 326 MB at ~2.5 Gbps, kubelet 342 MB in 9.8 s |
+| Full `e2e-test.sh -x all` | ALL TESTS PASSED |
 
 ## Production notes
 

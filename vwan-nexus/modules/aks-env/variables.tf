@@ -31,9 +31,14 @@ variable "internal_cidr" {
   }
 }
 
-variable "nexus_cidr" {
-  description = "Destination prefix(es) reached through the NVA -> hub (Nexus)"
-  type        = string
+variable "destination_cidrs" {
+  description = "Private prefixes (Nexus, on-prem) that AKS reaches through the transit NVA -> hub. Everything else uses the NAT gateway."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.destination_cidrs) > 0 && length(var.destination_cidrs) <= 50
+    error_message = "destination_cidrs must contain between 1 and 50 prefixes; summarise on-prem ranges."
+  }
 }
 
 variable "ssh_public_key" {

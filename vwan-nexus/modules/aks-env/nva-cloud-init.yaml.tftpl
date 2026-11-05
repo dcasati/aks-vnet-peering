@@ -15,11 +15,13 @@ write_files:
       sysctl --system >/dev/null
       IF=$(ip route show default | awk '{print $5}' | head -n1)
       sysctl -w "net.ipv4.conf.$IF.send_redirects=0"
-      # SNAT AKS node traffic (${internal_cidr}) to this instance's routable transit IP for Nexus only.
-      iptables -t nat -C POSTROUTING -s ${internal_cidr} -d ${nexus_cidr} -o "$IF" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -s ${internal_cidr} -d ${nexus_cidr} -o "$IF" -j MASQUERADE
-      iptables -C FORWARD -s ${internal_cidr} -d ${nexus_cidr} -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -s ${internal_cidr} -d ${nexus_cidr} -j ACCEPT
+      # SNAT AKS node traffic (${internal_cidr}) to this instance's routable transit IP, only for the private destinations.
+      for DST in ${join(" ", destination_cidrs)}; do
+        iptables -t nat -C POSTROUTING -s ${internal_cidr} -d "$DST" -o "$IF" -j MASQUERADE 2>/dev/null || \
+          iptables -t nat -A POSTROUTING -s ${internal_cidr} -d "$DST" -o "$IF" -j MASQUERADE
+        iptables -C FORWARD -s ${internal_cidr} -d "$DST" -j ACCEPT 2>/dev/null || \
+          iptables -A FORWARD -s ${internal_cidr} -d "$DST" -j ACCEPT
+      done
       iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
       iptables -P FORWARD DROP
@@ -56,7 +58,7 @@ write_files:
   - path: /etc/systemd/system/nva-setup.service
     content: |
       [Unit]
-      Description=Configure SNAT NVA forwarding for AKS -> Nexus
+      Description=Configure SNAT NVA forwarding for AKS -> private destinations
       After=network-online.target
       Wants=network-online.target
 
