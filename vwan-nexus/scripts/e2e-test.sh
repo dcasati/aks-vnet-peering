@@ -298,7 +298,7 @@ EOF
   else
     grep -qxF "$_client" <<<"$_nva_ips" || fail "on-prem saw $_client, not an NVA transit IP ($(tr '\n' ' ' <<<"$_nva_ips"))"
   fi
-  log "PASS onprem: on-prem sees NVA transit IP $_client; $AKS_CIDR never advertised to on-prem"
+  log "PASS onprem: on-prem sees ${_azfw_subnet:+Azure Firewall IP}${_azfw_subnet:-NVA transit IP} $_client; $AKS_CIDR never advertised to on-prem"
 }
 
 do_ca_trust() {
