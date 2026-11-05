@@ -19,6 +19,24 @@ variable "existing_virtual_hub_id" {
   default     = null
 }
 
+variable "private_clusters" {
+  description = "Private AKS API servers, with ALL egress forced through each transit next hop and then the hub's default route (routing intent / secured hub). The hub firewall must allow the AKS required outbound FQDNs from the transit prefixes."
+  type        = bool
+  default     = true
+}
+
+variable "create_hub_firewall" {
+  description = "PoC only: secure the PoC hub with an Azure Firewall and an Internet routing-intent policy, standing in for the production hub firewall that private clusters egress through"
+  type        = bool
+  default     = false
+}
+
+variable "create_bastion" {
+  description = "PoC only: with private_clusters, create Azure Bastion (Standard, IP connect + tunnelling) per AKS VNet so the e2e script can tunnel to the private API server."
+  type        = bool
+  default     = false
+}
+
 variable "hub_address_prefix" {
   description = "Address prefix for the PoC virtual hub (ignored when existing_virtual_hub_id is set)"
   type        = string

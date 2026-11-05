@@ -32,7 +32,7 @@ variable "internal_cidr" {
 }
 
 variable "destination_cidrs" {
-  description = "Private prefixes (Nexus, on-prem) that AKS reaches through the transit NVA -> hub. Everything else uses the NAT gateway."
+  description = "Private prefixes (Nexus, on-prem) that AKS reaches through the transit NVA -> hub. Public clusters send everything else to the NAT gateway; private clusters send it through the transit too."
   type        = list(string)
 
   validation {
@@ -68,6 +68,15 @@ variable "next_hop_override" {
   default     = null
 }
 
+variable "extra_peer_vnet" {
+  description = "Optional VNet (e.g. an Azure Firewall transit under test) to peer with the AKS VNet before the cluster is created."
+  type = object({
+    id   = string
+    name = string
+  })
+  default = null
+}
+
 variable "custom_ca_trust_certificates" {
   description = "PEM CA certificates added to the node trust store (AKS custom CA trust; max 10). Empty disables it."
   type        = list(string)
@@ -77,4 +86,16 @@ variable "custom_ca_trust_certificates" {
     condition     = length(var.custom_ca_trust_certificates) <= 10
     error_message = "AKS custom CA trust accepts at most 10 certificates."
   }
+}
+
+variable "private_cluster" {
+  description = "Private API server, and all egress forced through the transit next hop and the hub's default route (outboundType userDefinedRouting, no NAT gateway)."
+  type        = bool
+  default     = false
+}
+
+variable "create_bastion" {
+  description = "PoC only: with private_cluster, create Azure Bastion (Standard, IP connect + tunnelling) in the AKS VNet to reach the private API server."
+  type        = bool
+  default     = false
 }

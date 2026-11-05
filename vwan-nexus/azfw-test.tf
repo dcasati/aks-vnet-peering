@@ -12,7 +12,6 @@ locals {
   azfw_subnet     = cidrsubnet(var.azfw_test_cidr, 1, 0)
   azfw_mgmt       = cidrsubnet(var.azfw_test_cidr, 1, 1)
   azfw_private_ip = var.create_azfw_test ? azurerm_firewall.test[0].ip_configuration[0].private_ip_address : null
-  azfw_aks_vnet   = var.create_azfw_test ? module.env[var.azfw_test_env].aks_vnet_id : null
 }
 
 resource "azurerm_virtual_network" "azfw" {
@@ -86,6 +85,26 @@ resource "azurerm_firewall_policy_rule_collection_group" "azfw" {
       destination_ports     = ["80", "443"]
     }
   }
+
+  # Private clusters send all egress here (0.0.0.0/0 UDR); the firewall forwards it to the hub's
+  # default route (forced tunnelling). PoC: any port; production should allow only the AKS
+  # required outbound FQDNs/ports.
+  dynamic "network_rule_collection" {
+    for_each = var.private_clusters ? [1] : []
+    content {
+      name     = "allow-aks-egress"
+      priority = 200
+      action   = "Allow"
+
+      rule {
+        name                  = "aks-to-any"
+        protocols             = ["TCP", "UDP"]
+        source_addresses      = [var.environments[var.azfw_test_env].internal_cidr]
+        destination_addresses = ["*"]
+        destination_ports     = ["*"]
+      }
+    }
+  }
 }
 
 resource "azurerm_firewall" "test" {
@@ -117,24 +136,11 @@ resource "azurerm_virtual_hub_connection" "azfw" {
   name                      = "conn-azfw-test"
   virtual_hub_id            = local.virtual_hub_id
   remote_virtual_network_id = azurerm_virtual_network.azfw[0].id
-  # PoC hub has no routing intent. With forced tunnelling, set true so AzureFirewallSubnet learns 0/0.
-  internet_security_enabled = false
+  # Private clusters: AzureFirewallSubnet learns the hub's 0/0 (forced tunnelling); the management
+  # subnet keeps its own system route to the internet.
+  internet_security_enabled = var.private_clusters
 }
 
-resource "azurerm_virtual_network_peering" "aks_to_azfw" {
-  count                     = local.azfw
-  name                      = "peer-aks-to-azfw-test"
-  resource_group_name       = azurerm_resource_group.rg.name
-  virtual_network_name      = element(split("/", local.azfw_aks_vnet), 8)
-  remote_virtual_network_id = azurerm_virtual_network.azfw[0].id
-  allow_forwarded_traffic   = true
-}
+# The AKS VNet <-> firewall VNet peerings live in modules/aks-env (extra_peer_vnet), so the
+# private cluster is created only after its next hop is reachable.
 
-resource "azurerm_virtual_network_peering" "azfw_to_aks" {
-  count                     = local.azfw
-  name                      = "peer-azfw-test-to-aks"
-  resource_group_name       = azurerm_resource_group.rg.name
-  virtual_network_name      = azurerm_virtual_network.azfw[0].name
-  remote_virtual_network_id = local.azfw_aks_vnet
-  allow_forwarded_traffic   = true
-}

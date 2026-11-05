@@ -11,7 +11,8 @@ resource "tls_private_key" "ssh" {
 locals {
   nexus_fqdn = "${var.nexus_hostname}.${var.private_dns_zone_name}"
 
-  # Everything AKS reaches through its transit NVA -> vWAN hub. Internet/MCR stays on the AKS NAT gateway.
+  # Everything AKS reaches through its transit NVA -> vWAN hub. Public clusters send internet/MCR to their
+  # NAT gateway; private clusters send that through the transit and the hub's default route as well.
   private_destinations = distinct(concat(
     [var.nexus_cidr],
     var.onprem_cidrs,
@@ -94,6 +95,13 @@ resource "azurerm_virtual_hub" "hub" {
   virtual_wan_id      = azurerm_virtual_wan.vwan[0].id
   address_prefix      = var.hub_address_prefix
   sku                 = "Standard"
+
+  lifecycle {
+    precondition {
+      condition     = !var.private_clusters || var.create_hub_firewall
+      error_message = "private_clusters forces egress to the hub's default route; the PoC hub has none unless create_hub_firewall = true."
+    }
+  }
 }
 
 locals {
@@ -279,8 +287,19 @@ module "env" {
   admin_principal_id  = data.azurerm_client_config.current.object_id
 
   next_hop_override = var.create_azfw_test && each.key == var.azfw_test_env ? local.azfw_private_ip : null
+  # Peered from inside the module so the cluster (which bootstraps through its next hop) waits for it.
+  extra_peer_vnet = var.create_azfw_test && each.key == var.azfw_test_env ? {
+    id   = azurerm_virtual_network.azfw[0].id
+    name = azurerm_virtual_network.azfw[0].name
+  } : null
+
+  private_cluster = var.private_clusters
+  create_bastion  = var.create_bastion
 
   custom_ca_trust_certificates = var.enable_custom_ca_trust ? [tls_self_signed_cert.ca.cert_pem] : []
+
+  # The transit connection only propagates the hub's default route once routing intent exists.
+  depends_on = [azurerm_virtual_hub_routing_intent.hub]
 }
 
 # =============================================================================

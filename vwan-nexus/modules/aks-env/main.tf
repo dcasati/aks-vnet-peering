@@ -1,11 +1,20 @@
 locals {
   internal_len = tonumber(split("/", var.internal_cidr)[1])
 
-  aks_api_subnet_cidr    = cidrsubnet(var.internal_cidr, 28 - local.internal_len, 0) # x.x.0.0/28
-  aks_system_subnet_cidr = cidrsubnet(var.internal_cidr, 26 - local.internal_len, 1) # x.x.0.64/26
-  aks_user_subnet_cidr   = cidrsubnet(var.internal_cidr, 24 - local.internal_len, 1) # x.x.1.0/24
+  aks_api_subnet_cidr    = cidrsubnet(var.internal_cidr, 28 - local.internal_len, 0)  # x.x.0.0/28
+  aks_system_subnet_cidr = cidrsubnet(var.internal_cidr, 26 - local.internal_len, 1)  # x.x.0.64/26
+  aks_user_subnet_cidr   = cidrsubnet(var.internal_cidr, 24 - local.internal_len, 1)  # x.x.1.0/24
+  jumpbox_subnet_cidr    = cidrsubnet(var.internal_cidr, 28 - local.internal_len, 32) # x.x.2.0/28
+  bastion_subnet_cidr    = cidrsubnet(var.internal_cidr, 26 - local.internal_len, 9)  # x.x.2.64/26
 
   nva_ilb_ip = cidrhost(var.transit_cidr, 4)
+  next_hop   = coalesce(var.next_hop_override, local.nva_ilb_ip)
+
+  resource_group_id = join("/", slice(split("/", azurerm_virtual_network.aks.id), 0, 5))
+
+  # Private cluster: all egress (internet included) is forced through the transit next hop and
+  # then the hub's default route, so there is no NAT gateway and the NVA SNATs everything.
+  natgw = var.private_cluster ? 0 : 1
 }
 
 # =============================================================================
@@ -29,7 +38,8 @@ resource "azurerm_virtual_hub_connection" "transit" {
   name                      = "conn-${var.name}-transit"
   virtual_hub_id            = var.virtual_hub_id
   remote_virtual_network_id = azurerm_virtual_network.transit.id
-  internet_security_enabled = false
+  # true = propagate the hub's default route (routing intent / secured hub) into the transit VNet.
+  internet_security_enabled = var.private_cluster
 }
 
 # =============================================================================
@@ -95,10 +105,31 @@ resource "azurerm_virtual_network_peering" "transit_to_aks" {
   allow_forwarded_traffic      = true
 }
 
+# Optional peering to an alternative next hop (PoC Azure Firewall transit).
+resource "azurerm_virtual_network_peering" "aks_to_extra" {
+  count                     = var.extra_peer_vnet == null ? 0 : 1
+  name                      = "peer-aks-to-${trimprefix(var.extra_peer_vnet.name, "vnet-")}"
+  resource_group_name       = var.resource_group_name
+  virtual_network_name      = azurerm_virtual_network.aks.name
+  remote_virtual_network_id = var.extra_peer_vnet.id
+  allow_forwarded_traffic   = true
+}
+
+resource "azurerm_virtual_network_peering" "extra_to_aks" {
+  count                     = var.extra_peer_vnet == null ? 0 : 1
+  name                      = "peer-${trimprefix(var.extra_peer_vnet.name, "vnet-")}-to-aks"
+  resource_group_name       = var.resource_group_name
+  virtual_network_name      = var.extra_peer_vnet.name
+  remote_virtual_network_id = azurerm_virtual_network.aks.id
+  allow_forwarded_traffic   = true
+}
+
 # =============================================================================
-# 3. Internet egress for AKS (control plane deps, MCR, etc.) - not via the hub
+# 3. Internet egress for public clusters only (MCR, AKS endpoints) - not via the hub.
+#    Private clusters have none: their egress is forced through the transit and the hub.
 # =============================================================================
 resource "azurerm_public_ip" "natgw" {
+  count               = local.natgw
   name                = "pip-${var.name}-natgw"
   location            = var.location
   resource_group_name = var.resource_group_name
@@ -107,6 +138,7 @@ resource "azurerm_public_ip" "natgw" {
 }
 
 resource "azurerm_nat_gateway" "aks" {
+  count               = local.natgw
   name                = "ngw-${var.name}-aks"
   location            = var.location
   resource_group_name = var.resource_group_name
@@ -114,22 +146,26 @@ resource "azurerm_nat_gateway" "aks" {
 }
 
 resource "azurerm_nat_gateway_public_ip_association" "aks" {
-  nat_gateway_id       = azurerm_nat_gateway.aks.id
-  public_ip_address_id = azurerm_public_ip.natgw.id
+  count                = local.natgw
+  nat_gateway_id       = azurerm_nat_gateway.aks[0].id
+  public_ip_address_id = azurerm_public_ip.natgw[0].id
 }
 
 resource "azurerm_subnet_nat_gateway_association" "aks_system" {
+  count          = local.natgw
   subnet_id      = azurerm_subnet.aks_system.id
-  nat_gateway_id = azurerm_nat_gateway.aks.id
+  nat_gateway_id = azurerm_nat_gateway.aks[0].id
 }
 
 resource "azurerm_subnet_nat_gateway_association" "aks_user" {
+  count          = local.natgw
   subnet_id      = azurerm_subnet.aks_user.id
-  nat_gateway_id = azurerm_nat_gateway.aks.id
+  nat_gateway_id = azurerm_nat_gateway.aks[0].id
 }
 
 # =============================================================================
-# 4. UDR: private destinations (Nexus, on-prem) -> NVA internal LB in the peered transit VNet
+# 4. UDR: private destinations (Nexus, on-prem) -> NVA internal LB in the peered transit VNet.
+#    Private clusters also send 0.0.0.0/0 there (AKS outboundType userDefinedRouting).
 # =============================================================================
 resource "azurerm_route_table" "aks" {
   name                = "rt-${var.name}-aks-to-nexus"
@@ -142,7 +178,17 @@ resource "azurerm_route_table" "aks" {
       name                   = "via-transit-nva-${replace(route.value, "/[./]/", "-")}"
       address_prefix         = route.value
       next_hop_type          = "VirtualAppliance"
-      next_hop_in_ip_address = coalesce(var.next_hop_override, local.nva_ilb_ip)
+      next_hop_in_ip_address = local.next_hop
+    }
+  }
+
+  dynamic "route" {
+    for_each = var.private_cluster ? [1] : []
+    content {
+      name                   = "default-via-transit"
+      address_prefix         = "0.0.0.0/0"
+      next_hop_type          = "VirtualAppliance"
+      next_hop_in_ip_address = local.next_hop
     }
   }
 }
@@ -284,6 +330,7 @@ resource "azurerm_linux_virtual_machine_scale_set" "nva" {
   custom_data = base64encode(templatefile("${path.module}/nva-cloud-init.yaml.tftpl", {
     internal_cidr     = var.internal_cidr
     destination_cidrs = var.destination_cidrs
+    snat_all          = var.private_cluster
   }))
 
   network_interface {
@@ -327,23 +374,59 @@ resource "azurerm_role_assignment" "aks_rt" {
   principal_id         = azurerm_user_assigned_identity.aks.principal_id
 }
 
-resource "azurerm_kubernetes_automatic_cluster" "aks" {
-  name                = "aks-${var.name}"
-  location            = var.location
-  resource_group_name = var.resource_group_name
+# Created with azapi: azurerm_kubernetes_automatic_cluster doesn't expose networkProfile.outboundType,
+# and AKS Automatic rejects changing it after creation while node auto-provisioning is Auto
+# (OperationNotAllowed), so userDefinedRouting must be in the create request.
+resource "azapi_resource" "aks" {
+  type                      = "Microsoft.ContainerService/managedClusters@2026-07-01"
+  name                      = "aks-${var.name}"
+  parent_id                 = local.resource_group_id
+  location                  = var.location
+  schema_validation_enabled = false
 
   identity {
     type         = "UserAssigned"
     identity_ids = [azurerm_user_assigned_identity.aks.id]
   }
 
-  api_server_access {
-    subnet_id = azurerm_subnet.aks_api.id
+  body = {
+    sku = {
+      name = "Automatic"
+      tier = "Standard"
+    }
+    properties = {
+      # API server VNet integration; private = internal LB IP in snet-aks-api, no public FQDN.
+      apiServerAccessProfile = merge(
+        {
+          subnetId                       = azurerm_subnet.aks_api.id
+          enablePrivateCluster           = var.private_cluster
+          enablePrivateClusterPublicFQDN = false
+        },
+        var.private_cluster ? { privateDNSZone = "system" } : {},
+      )
+      hostedSystemProfile = {
+        enabled            = true
+        systemNodeSubnetId = azurerm_subnet.aks_system.id
+        nodeSubnetId       = azurerm_subnet.aks_user.id
+      }
+      # Private: every node/pod flow follows the subnet route table (0.0.0.0/0 -> transit).
+      networkProfile = {
+        outboundType = var.private_cluster ? "userDefinedRouting" : "loadBalancer"
+      }
+      # Lets containerd/kubelet verify a Nexus cert issued by a private CA.
+      # The API stores base64(PEM); LF line endings only.
+      securityProfile = length(var.custom_ca_trust_certificates) > 0 ? {
+        customCATrustCertificates = [for pem in var.custom_ca_trust_certificates : base64encode(replace(pem, "\r\n", "\n"))]
+      } : null
+    }
   }
 
-  hosted_system {
-    system_node_subnet_id = azurerm_subnet.aks_system.id
-    node_subnet_id        = azurerm_subnet.aks_user.id
+  response_export_values = ["properties.privateFQDN", "properties.fqdn"]
+
+  timeouts {
+    create = "90m"
+    update = "90m"
+    delete = "90m"
   }
 
   depends_on = [
@@ -353,39 +436,147 @@ resource "azurerm_kubernetes_automatic_cluster" "aks" {
     azurerm_subnet_nat_gateway_association.aks_user,
     azurerm_subnet_route_table_association.aks_system,
     azurerm_subnet_route_table_association.aks_user,
+    # Nodes bootstrap through the NVA: its SNAT must be in place first.
+    azurerm_lb_rule.ha_ports,
+    azurerm_linux_virtual_machine_scale_set.nva,
+    azurerm_virtual_network_peering.aks_to_extra,
+    azurerm_virtual_network_peering.extra_to_aks,
   ]
 }
 
 resource "azurerm_role_assignment" "aks_admin" {
-  scope                = azurerm_kubernetes_automatic_cluster.aks.id
+  scope                = azapi_resource.aks.id
   role_definition_name = "Azure Kubernetes Service RBAC Cluster Admin"
   principal_id         = var.admin_principal_id
 }
 
-# =============================================================================
-# Custom CA trust: lets containerd/kubelet verify a Nexus cert issued by a
-# private CA. azurerm_kubernetes_automatic_cluster doesn't expose
-# securityProfile.customCATrustCertificates, so it is merged in with azapi.
-# AKS reimages the hosted system nodes; NAP NodeClaims that already exist are
-# NOT marked drifted and must be recycled (see scripts/e2e-test.sh).
-# =============================================================================
-resource "azapi_update_resource" "custom_ca_trust" {
-  count = length(var.custom_ca_trust_certificates) > 0 ? 1 : 0
 
-  type        = "Microsoft.ContainerService/managedClusters@2026-07-01"
-  resource_id = azurerm_kubernetes_automatic_cluster.aks.id
+# =============================================================================
+# 7. PoC only: Azure Bastion + jump VM to reach the private API server.
+# Its IP sits in the reused, non-routable internal range, so it is reachable only from inside
+# this VNet. The jump VM has no public IP: the e2e script opens a Bastion native-client tunnel
+# to its SSH port, then an SSH local forward to the API server. (Bastion IP-based tunnels
+# only allow ports 22/3389, so they can't target the API server's 443 directly.)
+# In production use in-VNet agents or `az aks command invoke` instead.
+# =============================================================================
+locals {
+  bastion = var.private_cluster && var.create_bastion ? 1 : 0
+}
 
-  body = {
-    properties = {
-      securityProfile = {
-        # The API stores base64(PEM); LF line endings only.
-        customCATrustCertificates = [for pem in var.custom_ca_trust_certificates : base64encode(replace(pem, "\r\n", "\n"))]
-      }
-    }
+resource "azurerm_subnet" "bastion" {
+  count                = local.bastion
+  name                 = "AzureBastionSubnet"
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.aks.name
+  address_prefixes     = [local.bastion_subnet_cidr]
+}
+
+resource "azurerm_public_ip" "bastion" {
+  count               = local.bastion
+  name                = "pip-${var.name}-bastion"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+}
+
+resource "azurerm_bastion_host" "aks" {
+  count               = local.bastion
+  name                = "bas-${var.name}-aks"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  sku                 = "Standard"
+  ip_connect_enabled  = true
+  tunneling_enabled   = true
+
+  ip_configuration {
+    name                 = "bastion"
+    subnet_id            = azurerm_subnet.bastion[0].id
+    public_ip_address_id = azurerm_public_ip.bastion[0].id
+  }
+}
+
+resource "azurerm_subnet" "jumpbox" {
+  count                = local.bastion
+  name                 = "snet-jumpbox"
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.aks.name
+  address_prefixes     = [local.jumpbox_subnet_cidr]
+}
+
+resource "azurerm_network_security_group" "jumpbox" {
+  count               = local.bastion
+  name                = "nsg-${var.name}-jumpbox"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  security_rule {
+    name                       = "Allow-SSH-From-Bastion"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "22"
+    source_address_prefix      = local.bastion_subnet_cidr
+    destination_address_prefix = "*"
   }
 
-  timeouts {
-    create = "60m"
-    update = "60m"
+  security_rule {
+    name                       = "Deny-Other-Inbound"
+    priority                   = 4000
+    direction                  = "Inbound"
+    access                     = "Deny"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "*"
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_subnet_network_security_group_association" "jumpbox" {
+  count                     = local.bastion
+  subnet_id                 = azurerm_subnet.jumpbox[0].id
+  network_security_group_id = azurerm_network_security_group.jumpbox[0].id
+}
+
+resource "azurerm_network_interface" "jumpbox" {
+  count               = local.bastion
+  name                = "nic-${var.name}-jumpbox"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  ip_configuration {
+    name                          = "ipconfig1"
+    subnet_id                     = azurerm_subnet.jumpbox[0].id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "jumpbox" {
+  count                 = local.bastion
+  name                  = "vm-${var.name}-jumpbox"
+  location              = var.location
+  resource_group_name   = var.resource_group_name
+  size                  = "Standard_D2s_v4"
+  admin_username        = "azureuser"
+  network_interface_ids = [azurerm_network_interface.jumpbox[0].id]
+
+  admin_ssh_key {
+    username   = "azureuser"
+    public_key = var.ssh_public_key
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "ubuntu-24_04-lts"
+    sku       = "server"
+    version   = "latest"
+  }
+
+  os_disk {
+    storage_account_type = "StandardSSD_LRS"
+    caching              = "ReadWrite"
   }
 }

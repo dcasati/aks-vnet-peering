@@ -13,6 +13,10 @@ output "environments" {
     transit_cidr      = m.transit_cidr
     aks_internal_cidr = m.aks_internal_cidr
     nva_ilb_ip        = m.nva_ilb_ip
+    private_cluster   = m.private_cluster
+    api_server_fqdn   = m.api_server_private_fqdn
+    bastion_name      = m.bastion_name
+    jumpbox_id        = m.jumpbox_id
   } }
 }
 
@@ -57,4 +61,20 @@ output "azfw_test" {
     private_ip = local.azfw_private_ip
     subnet     = local.azfw_subnet
   } : null
+}
+
+output "ssh_private_key" {
+  description = "PoC SSH key for the NVA and Bastion-only jump VMs"
+  value       = tls_private_key.ssh.private_key_openssh
+  sensitive   = true
+}
+
+output "hub_firewall_private_ip" {
+  description = "PoC hub firewall (create_hub_firewall) that private clusters egress through"
+  value       = var.create_hub_firewall ? azurerm_firewall.hub[0].virtual_hub[0].private_ip_address : null
+}
+
+output "hub_firewall_public_ips" {
+  description = "Internet egress IPs of the PoC hub firewall (create_hub_firewall)"
+  value       = var.create_hub_firewall ? azurerm_firewall.hub[0].virtual_hub[0].public_ip_addresses : []
 }
