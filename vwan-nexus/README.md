@@ -13,7 +13,7 @@ The repository root peers a single `/28` subnet with **subnet peering**. A vWAN 
 
 ## Design: per-environment transit VNet
 
-![AKS Automatic to Nexus over vWAN: per-environment transit /28](docs/architecture.svg)
+![AKS Automatic to Nexus and on-premises over vWAN: per-environment transit /28](docs/architecture.svg)
 
 Editable source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw) (open in Excalidraw).
 
