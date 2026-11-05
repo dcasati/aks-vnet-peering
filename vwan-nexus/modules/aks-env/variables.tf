@@ -62,6 +62,12 @@ variable "admin_principal_id" {
   type        = string
 }
 
+variable "next_hop_override" {
+  description = "Optional private IP that replaces the NVA ILB as next hop for destination_cidrs (e.g. an Azure Firewall under test)."
+  type        = string
+  default     = null
+}
+
 variable "custom_ca_trust_certificates" {
   description = "PEM CA certificates added to the node trust store (AKS custom CA trust; max 10). Empty disables it."
   type        = list(string)

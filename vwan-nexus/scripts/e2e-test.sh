@@ -289,7 +289,15 @@ EOF
   _client=$(sed -n 's/^client=\([0-9.]*\).*/\1/p' <<<"$_out")
   _nva_ips=$(az vmss nic list -g "$RESOURCE_GROUP" --vmss-name "$NVA_VMSS" \
     --query '[].ipConfigurations[0].privateIPAddress' -o tsv)
-  grep -qxF "$_client" <<<"$_nva_ips" || fail "on-prem saw $_client, not an NVA transit IP ($(tr '\n' ' ' <<<"$_nva_ips"))"
+  # With the Azure Firewall test enabled for this env, the SNAT source is a firewall instance IP.
+  _azfw_subnet=$(terraform -chdir="$TF_DIR" output -json azfw_test 2>/dev/null |
+    jq -r --arg e "$ENV_NAME" 'select(. != null and .env == $e) | .subnet')
+  if [[ -n "$_azfw_subnet" ]]; then
+    python3 -c 'import ipaddress,sys; sys.exit(ipaddress.ip_address(sys.argv[1]) not in ipaddress.ip_network(sys.argv[2]))' \
+      "$_client" "$_azfw_subnet" || fail "on-prem saw $_client, not an Azure Firewall IP ($_azfw_subnet)"
+  else
+    grep -qxF "$_client" <<<"$_nva_ips" || fail "on-prem saw $_client, not an NVA transit IP ($(tr '\n' ' ' <<<"$_nva_ips"))"
+  fi
   log "PASS onprem: on-prem sees NVA transit IP $_client; $AKS_CIDR never advertised to on-prem"
 }
 

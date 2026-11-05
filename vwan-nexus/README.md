@@ -64,6 +64,7 @@ Editable source: [`docs/architecture.excalidraw`](docs/architecture.excalidraw) 
 | `scripts/e2e-test.sh` | End-to-end test: hub routes, NVA health, CA trust, pod pull, kubelet pull (recycles NAP nodes on x509) |
 | `docs/architecture.{svg,excalidraw}` | Architecture diagram |
 | `onprem-sim.tf`, `onprem-echo-cloud-init.yaml` | Optional simulated on-prem: VNet + VPN gateway + BGP to the hub, and an HTTP echo server |
+| `azfw-test.tf` | Optional Azure Firewall transit for one environment, replacing its NVA as next hop (`create_azfw_test`) |
 | `terraform.tfvars.example` | All three environments on an existing hub, all reusing `100.64.0.0/16` |
 
 By default only `dev` is deployed in `westus3`, along with a new PoC hub and a Nexus stand-in VM. The NVA uses `Standard_D2s_v4` and Nexus uses `Standard_D4s_v4`, because DSv5 isn't offered to every subscription in West US 2/3.
@@ -134,7 +135,7 @@ What changes:
 | NVA | `upgrade_mode = "Manual"` and cloud-init only runs at provisioning, so roll the new rules out with `scripts/e2e-test.sh -x nva-reimage` (one instance at a time, verifies the rules) |
 | Hub / ExpressRoute | Nothing new. The hub's ER gateway already advertises connected VNets (the transit `/28`s) to on-prem and propagates on-prem routes to them |
 | On-prem firewalls | Allow the transit `/28`s. Each environment has a stable, distinct source: DEV `172.19.0.0/28`, QA `172.20.0.0/28`, PROD `172.21.0.0/28` |
-| Check Point (routing intent) | With *private* routing intent, VNet ↔ branch traffic is inspected by the hub firewall. Allow the same `/28`s there |
+| Hub firewall (routing intent) | With *private* routing intent, VNet ↔ branch traffic is inspected by the hub firewall. Allow the same `/28`s there |
 
 **Only some workloads need on-prem.** Routing is per subnet, not per pod, so restrict it in the cluster: AKS Automatic runs Cilium, so a default-deny egress `NetworkPolicy` with an `ipBlock` for the on-prem summaries in namespaces that don't need it (or an allow-list in those that do) keeps on-prem reachable only where intended. Image pulls are made by the kubelet on the node and aren't affected by pod network policy.
 
@@ -167,6 +168,38 @@ Results (westus3, DEV, `onprem_cidrs` simulated by `10.40.0.0/24`):
 | Nexus pulls with on-prem enabled | Unchanged: crane 326 MB at ~2.5 Gbps, kubelet 342 MB in 9.8 s |
 | Full `e2e-test.sh -x all` | ALL TESTS PASSED |
 
+## Alternative: Azure Firewall instead of the NVA (tested)
+
+`-var create_azfw_test=true` (see `azfw-test.tf`) adds a separate transit VNet (`azfw_test_cidr`, default `172.20.0.0/25`) with an internal-only Azure Firewall Standard, connects it to the hub and peers it with one environment's AKS VNet (`azfw_test_env`, default `prod`). That environment's UDR next hop moves from the NVA ILB to the firewall's private IP; nothing else changes.
+
+```
+AKS node 100.64.x ──UDR──▶ Azure Firewall 172.20.0.4 (SNAT → 172.20.0.x) ─▶ hub ─▶ Nexus / on-prem
+```
+
+| Setting | Why |
+|---|---|
+| `AzureFirewallSubnet` `/26` + `AzureFirewallManagementSubnet` `/26` | Both are fixed minimum sizes, so each environment needs a routable `/25` instead of a `/28` |
+| Management NIC, no data-path public IP | Internal only. The management subnet still needs a public IP and a `0.0.0.0/0` route **directly to Internet** (its system route table, gateway route propagation disabled): an exception to any forced egress. The PoC hub has no routing intent, so the connection doesn't propagate a default route |
+| Policy `private_ip_ranges = ["255.255.255.255/32"]` | Azure Firewall doesn't SNAT RFC 1918 or `100.64.0.0/10` destinations by default; this forces SNAT so Nexus/on-prem see a routable source |
+| Network rule: TCP 80/443 from the AKS VNet to `private_destinations` | Same scope as the NVA |
+
+Results (westus3, PROD, same day as the NVA runs):
+
+| Test | NVA (D2s_v4 × 2) | Azure Firewall Standard |
+|---|---|---|
+| Hub routes | transit `/28` | `172.20.0.0/25` advertised; `100.64.0.0/16` never |
+| Pod → Nexus, crane 325.8 MB | 1.18 s (2.32 Gbps) | 1.52 s (1.80 Gbps) |
+| Kubelet pull, 342 MB | 20 s (fresh cluster) | 9.9 s |
+| Pod → on-prem server | `client=172.21.0.5` (NVA) | `client=172.20.0.6` (firewall instance) |
+
+Single samples; treat throughput as indicative. Azure Firewall Standard is documented at up to 1.5 Gbps per TCP flow and about 3 Gbps before it autoscales (5–7 minutes per step, 30 Gbps maximum). Burst scale-outs that pull many large images at once can hit that ceiling; consider prescaling.
+
+**One firewall per environment.** Like the NVA transit, a firewall can't be shared while every AKS VNet reuses `100.64.0.0/16`: one VNet can't peer with overlapping VNets, and replies to `100.64.x` would be ambiguous. It also keeps a distinct SNAT source per environment.
+
+**Internet egress.** Pod/node internet traffic doesn't touch the firewall: the UDR only sends `private_destinations` to it, and `0.0.0.0/0` stays on the AKS NAT gateway. The firewall's own internet traffic is management only, through the management public IP.
+
+To revert, set `create_azfw_test=false` and apply: the UDR goes back to the NVA ILB and the firewall is removed.
+
 ## Production notes
 
 - **TLS for kubelet pulls.** containerd on AKS Automatic can't be configured for insecure registries.
@@ -179,8 +212,12 @@ Results (westus3, DEV, `onprem_cidrs` simulated by `10.40.0.0/24`):
   - **NVA:** use a D/F-series SKU with accelerated networking. Avoid B-series. Use the instance count and scale-out to add capacity.
   - **Nexus:** run it HA with a blob store sized for concurrent reads.
   - **Pod spec:** use `imagePullPolicy: IfNotPresent` and keep images small. Artifact Streaming is ACR-only.
-- **Hub routing intent / Check Point.** If private-traffic routing intent is enabled on the hub, transit-to-Nexus traffic is also inspected by the hub firewall. That adds a hop and its throughput limit, and the firewall must allow the transit `/28`s to reach Nexus.
+- **Hub routing intent.** If private-traffic routing intent is enabled on the hub, transit-to-Nexus traffic is also inspected by the hub firewall. That adds a hop and its throughput limit, and the firewall must allow the transit `/28`s to reach Nexus.
 - **CIDR hygiene.** The Nexus and hub prefixes must not overlap the AKS VNet range or the cluster's overlay pod and service CIDRs (defaults `10.244.0.0/16` and `10.0.0.0/16`).
+- **Private clusters with forced tunnelling (not yet tested in this PoC).** The PoC clusters are public and egress through a NAT gateway.
+  - With `outboundType = userDefinedRouting`, the AKS VNets still can't learn the hub's `0.0.0.0/0` (they aren't hub-connected), so the AKS UDR must send `0.0.0.0/0` to the transit appliance. The NVA then SNATs everything, not only `private_destinations`, and the transit connection must propagate the default route. The hub firewall must allow the AKS required FQDNs from the transit ranges.
+  - With Azure Firewall this is forced-tunnelling mode: `AzureFirewallSubnet` learns `0.0.0.0/0` from the hub (connection propagates the default route) while the management subnet keeps its system route to Internet.
+  - A private API server's IP lives in the reused, non-routable `100.64.0.0/16`, so it isn't reachable from the hub or on-prem. Plan for agents/jump hosts inside each AKS VNet or `az aks command invoke`.
 - **Alternatives:**
-  - **Azure Firewall** in each transit VNet with SNAT set to *always* (private ranges `255.255.255.255/32`). It's managed and HA, with no VMs to patch, but needs a routable `/26` per environment and costs more.
+  - **Azure Firewall** in each transit VNet instead of the NVA. Tested; see [Alternative: Azure Firewall](#alternative-azure-firewall-instead-of-the-nva-tested).
   - **Private Link service Direct Connect** (preview). It's a private endpoint in the AKS VNet with a PLS DC in the transit VNet targeting the Nexus IP. It's native SNAT with no UDRs, but it's preview-only and reaching Nexus through the hub is unvalidated.

@@ -11,7 +11,6 @@ locals {
   onprem_gw_subnet   = cidrsubnet(var.onprem_sim_cidr, 3, 0) # /27 from a /24
   onprem_vm_subnet   = cidrsubnet(var.onprem_sim_cidr, 3, 1)
   onprem_echo_ip     = cidrhost(local.onprem_vm_subnet, 8)
-  transit_cidrs      = [for e in values(var.environments) : e.transit_cidr]
   hub_vpn_instance_0 = var.create_onprem_sim ? azurerm_vpn_gateway.hub[0].bgp_settings[0].instance_0_bgp_peering_address[0] : null
   hub_vpn_instance_0_public_ip = var.create_onprem_sim ? one([
     for c in azurerm_vpn_gateway.hub[0].ip_configuration : c.public_ip_address
@@ -188,7 +187,7 @@ resource "azurerm_network_security_group" "onprem_vm" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "80"
-    source_address_prefixes    = local.transit_cidrs
+    source_address_prefixes    = local.snat_source_cidrs
     destination_address_prefix = "*"
   }
 

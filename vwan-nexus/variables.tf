@@ -155,3 +155,21 @@ variable "onprem_sim_asn" {
   type        = number
   default     = 65010
 }
+
+variable "create_azfw_test" {
+  description = "PoC only: put an Azure Firewall (Standard, management NIC, no data-plane public IP) in its own transit VNet and route one environment through it instead of its NVA"
+  type        = bool
+  default     = false
+}
+
+variable "azfw_test_env" {
+  description = "Environment whose AKS routes point at the Azure Firewall under test"
+  type        = string
+  default     = "prod"
+}
+
+variable "azfw_test_cidr" {
+  description = "Routable /25 for the firewall transit VNet: AzureFirewallSubnet (/26) + AzureFirewallManagementSubnet (/26)"
+  type        = string
+  default     = "172.20.0.0/25"
+}

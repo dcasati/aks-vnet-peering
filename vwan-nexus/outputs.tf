@@ -49,3 +49,12 @@ output "onprem_sim" {
     gateway_name = azurerm_virtual_network_gateway.onprem[0].name
   } : null
 }
+
+output "azfw_test" {
+  description = "Azure Firewall under test (null unless create_azfw_test)"
+  value = var.create_azfw_test ? {
+    env        = var.azfw_test_env
+    private_ip = local.azfw_private_ip
+    subnet     = local.azfw_subnet
+  } : null
+}

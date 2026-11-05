@@ -17,6 +17,12 @@ locals {
     var.onprem_cidrs,
     var.create_onprem_sim ? [var.onprem_sim_cidr] : [],
   ))
+
+  # Source ranges Nexus and on-prem accept: every transit /28, plus the Azure Firewall subnet under test.
+  snat_source_cidrs = concat(
+    [for e in values(var.environments) : e.transit_cidr],
+    var.create_azfw_test ? [local.azfw_subnet] : [],
+  )
 }
 
 # =============================================================================
@@ -173,7 +179,7 @@ resource "azurerm_network_security_group" "nexus" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "443"
-    source_address_prefixes    = [for e in values(var.environments) : e.transit_cidr]
+    source_address_prefixes    = local.snat_source_cidrs
     destination_address_prefix = "*"
   }
 
@@ -271,6 +277,8 @@ module "env" {
   nva_vmss_instances  = var.nva_vmss_instances
   nva_zones           = var.nva_zones
   admin_principal_id  = data.azurerm_client_config.current.object_id
+
+  next_hop_override = var.create_azfw_test && each.key == var.azfw_test_env ? local.azfw_private_ip : null
 
   custom_ca_trust_certificates = var.enable_custom_ca_trust ? [tls_self_signed_cert.ca.cert_pem] : []
 }

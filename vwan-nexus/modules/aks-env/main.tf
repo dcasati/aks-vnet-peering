@@ -142,7 +142,7 @@ resource "azurerm_route_table" "aks" {
       name                   = "via-transit-nva-${replace(route.value, "/[./]/", "-")}"
       address_prefix         = route.value
       next_hop_type          = "VirtualAppliance"
-      next_hop_in_ip_address = local.nva_ilb_ip
+      next_hop_in_ip_address = coalesce(var.next_hop_override, local.nva_ilb_ip)
     }
   }
 }
